@@ -1,0 +1,140 @@
+"""Configuration management for the application."""
+from typing import Optional, Tuple
+from pydantic_settings import BaseSettings
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class Settings(BaseSettings):
+    """Application settings loaded from environment variables."""
+    
+    # OpenAI Configuration (embeddings always use OpenAI; chat can use Groq — see LLM_PROVIDER)
+    OPENAI_API_KEY: str
+    OPENAI_MODEL: str
+    OPENAI_EMBEDDING_MODEL: str
+
+    # Chat / completion LLM: "openai" or "groq" (Groq uses OpenAI-compatible API; embeddings stay OpenAI-only)
+    LLM_PROVIDER: str
+    GROQ_API_KEY: Optional[str] = None
+    GROQ_API_BASE: Optional[str] = None
+    GROQ_MODEL: Optional[str] = None
+
+    # Optional cost config (USD per 1M tokens). If unset, cost logging is skipped.
+    # Provide these in .env if you want cost estimates in logs.
+    OPENAI_INPUT_USD_PER_1M: Optional[float] = None
+    OPENAI_OUTPUT_USD_PER_1M: Optional[float] = None
+    
+    # Zilliz Configuration
+    ZILLIZ_URI: str
+    ZILLIZ_TOKEN: str
+    ZILLIZ_COLLECTION_NAME: str = "pdf_chatbot_collection"
+    # Large inserts: smaller batches + long timeouts reduce WriteTimeout errors to Zilliz Cloud.
+    ZILLIZ_INSERT_BATCH_SIZE: int = 40
+    ZILLIZ_INSERT_TIMEOUT_SECONDS: float = 300.0
+    
+    # Application Configuration
+    UPLOAD_DIR: str = "uploads"
+    DOCUMENT_REGISTRY_FILE: str = "document_registry.json"
+    # Text chunking: target ~300-600 tokens (1 token ≈ 4 chars). Overlap 10-15%.
+    CHUNK_SIZE: int = 1000
+    CHUNK_OVERLAP: int = 200
+    CHUNK_TARGET_TOKENS: int = 500  # If > 0, overrides: size = this * 4 chars, overlap = size * CHUNK_OVERLAP_PERCENT / 100
+    CHUNK_OVERLAP_PERCENT: int = 12
+    MAX_CHUNKS_TO_RETRIEVE: int = 10
+    # Keep original PDF and extracted images on disk after ingest (object-storage style).
+    STORE_PDF_AFTER_INGEST: bool = True
+    STORE_EXTRACTED_IMAGES: bool = True
+    
+    # Reranker: retrieve more chunks, then rerank to keep best (improves answer quality)
+    ENABLE_RERANKER: bool = True
+    RERANK_INITIAL_TOP_K: int = 30   # Fetch this many from vector search
+    RERANK_TOP_N: int = 10           # After rerank, keep this many for LLM
+    
+    # Hybrid retrieval (vector + keyword/BM25)
+    ENABLE_KEYWORD_SEARCH: bool = True
+    HYBRID_VECTOR_WEIGHT: float = 0.7
+    HYBRID_KEYWORD_WEIGHT: float = 0.3
+    KEYWORD_TOP_K: int = 20
+
+    # Self-refining retrieval loop
+    ENABLE_QUERY_REWRITE: bool = True
+
+    # When the client sends no file_ids and the session has no scope, search all INGESTED
+    # documents in the library (retrieval + reranker still pick the best chunks per query).
+    CHAT_AUTO_SCOPE_ALL_INGESTED: bool = True
+
+    # Upload-time technology/domain tagging
+    # MODE: "prompt" = one LLM call (ChatGPT-style) then fallback heuristics on failure;
+    #       "heuristic" = resume/filename/keywords first; optional LLM at end if USE_LLM.
+    DOCUMENT_CLASSIFY_MODE: str = "heuristic"
+    DOCUMENT_CLASSIFY_MIN_SCORE: int = 10  # Min weighted keyword score (heuristic content path)
+    DOCUMENT_CLASSIFY_USE_LLM: bool = False  # In heuristic mode: LLM only when keywords yield general
+    DOCUMENT_CLASSIFY_LLM_MAX_CHARS: int = 6000  # Text excerpt sent to the classifier model
+    # Sum of resume/CV heuristic signals; above this → technology/domain general (see document_classifier)
+    DOCUMENT_CLASSIFY_RESUME_THRESHOLD: int = 9
+    
+    # Server Configuration
+    HOST: str = "0.0.0.0"
+    PORT: int = 8000
+
+    # Supabase (REST API). If empty or unreachable, app falls back to SQLite (backend/data/chat.db).
+    SUPABASE_URL: str = ""
+    SUPABASE_KEY: str = ""
+    # Optional: direct PostgreSQL for creating missing tables. Use either SUPABASE_DB_URL
+    # or the separate vars below (same as psycopg2.connect(user=..., password=..., host=..., port=..., dbname=...)).
+    SUPABASE_DB_URL: str = ""
+    SUPABASE_DB_USER: str = ""
+    SUPABASE_DB_PASSWORD: str = ""
+    SUPABASE_DB_HOST: str = ""
+    SUPABASE_DB_PORT: str = "5432"
+    SUPABASE_DB_NAME: str = "postgres"
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        case_sensitive = True
+
+
+def get_completion_client_config() -> Tuple[str, str, Optional[str]]:
+    """
+    OpenAI-compatible chat completions: (api_key, model, base_url).
+    base_url is set for Groq; None for native OpenAI.
+    Embeddings always use OPENAI_API_KEY + OPENAI_EMBEDDING_MODEL separately.
+    """
+    prov = (settings.LLM_PROVIDER or "").lower().strip()
+    if prov not in ("openai", "groq"):
+        raise ValueError('LLM_PROVIDER must be "openai" or "groq".')
+    if prov == "groq":
+        key = (settings.GROQ_API_KEY or "").strip()
+        base = (settings.GROQ_API_BASE or "").strip().rstrip("/")
+        model = (settings.GROQ_MODEL or "").strip()
+        if not key or not base or not model:
+            raise ValueError(
+                "LLM_PROVIDER=groq requires GROQ_API_KEY, GROQ_API_BASE, and GROQ_MODEL in .env. "
+                "Embeddings still use OPENAI_API_KEY + OPENAI_EMBEDDING_MODEL."
+            )
+        return key, model, base
+    # openai
+    return settings.OPENAI_API_KEY, settings.OPENAI_MODEL, None
+
+
+# Global settings instance
+try:
+    settings = Settings()
+    logger.info("Settings loaded successfully")
+    _prov = (settings.LLM_PROVIDER or "").lower().strip()
+    logger.info("LLM provider (chat/rerank/classifier): %s", _prov)
+    if _prov == "groq":
+        logger.info("Groq model: %s (embeddings: OpenAI %s)", settings.GROQ_MODEL, settings.OPENAI_EMBEDDING_MODEL)
+    else:
+        logger.info(f"OpenAI chat model: {settings.OPENAI_MODEL}")
+    logger.info(f"Embedding Model: {settings.OPENAI_EMBEDDING_MODEL}")
+    logger.info(f"Zilliz Collection: {settings.ZILLIZ_COLLECTION_NAME}")
+    logger.info(
+        "Document ingest classify mode: %s",
+        getattr(settings, "DOCUMENT_CLASSIFY_MODE", "heuristic"),
+    )
+except Exception as e:
+    logger.error(f"Failed to load settings: {type(e).__name__}: {str(e)}")
+    raise

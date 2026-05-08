@@ -1,0 +1,385 @@
+"""LLM service (OpenAI or Groq OpenAI-compatible API). Embeddings stay on OpenAI in embedding.py."""
+from openai import OpenAI
+from typing import List, Dict, Optional
+import json
+import re
+
+# Cap for RAW CODE sent to the LLM (line-boundary truncation below this size avoids mid-token cuts).
+RAW_CODE_MAX_CHARS = 8000
+
+
+def _truncate_raw_code(text: str, max_chars: int = RAW_CODE_MAX_CHARS) -> str:
+    """Truncate at line boundaries so functions/classes are less often split mid-line."""
+    if len(text) <= max_chars:
+        return text
+    lines = text.split("\n")
+    parts: List[str] = []
+    total = 0
+    for line in lines:
+        add_len = len(line) if not parts else len(line) + 1
+        if total + add_len > max_chars:
+            break
+        parts.append(line)
+        total += add_len
+    return "\n".join(parts) + f"\n... [truncated, {len(text)} chars total]"
+
+
+class LLMService:
+    """Service for querying OpenAI LLM with conversation memory."""
+    
+    # Default system prompt for RAG chatbot - STRICT CONTEXT-ONLY MODE WITH HELPFUL GUIDANCE
+    DEFAULT_SYSTEM_PROMPT = """You are a RAG assistant: answers must come ONLY from the RETRIEVED CONTEXT (PDF excerpts, RAW TABLE, RAW CODE blocks). Do not invent facts not grounded in that text.
+
+HOW TO READ REAL PDF CONTEXT (VERY IMPORTANT):
+- Chunks are messy: multi-column layouts, OCR, split tables, and broken lines are normal. Interpret charitably:
+  stitch meaning across fragments, use RAW TABLE / RAW CODE even when formatting looks ugly.
+- The ingest tag (e.g. Technology: python) means "this document/course is tagged as Python". It is NOT a list of
+  question phrases the user is allowed to ask. Any normal Python course subtopic (modules, scope, decorators,
+  loops, OOP, …) may still be answered if the excerpts OR attached raw blocks support it—even when the exact
+  section heading does not appear in the chunk.
+- If excerpts contain relevant keywords or examples for the question (e.g. global/local/nonlocal/def/import for
+  "variable scope"; import/__main__/packages for "modules"), you MUST explain using that material. Do NOT refuse
+  because the user's wording ("variable scope", "module basics") does not literally appear next to the tag "python".
+
+WHEN TO REFUSE:
+- Refuse only when NOTHING in the retrieved excerpts or raw blocks relates to the question at all (wrong subject
+  or empty substance). Do not refuse because the first excerpt looks generic if other excerpts or code are on-topic.
+
+OTHER RULES:
+- Multi-topic or comparison questions: use whatever relevant passages exist; synthesize comparisons when both sides appear.
+- Use chat history only to resolve pronouns and follow-ups, not to add facts absent from RETRIEVED CONTEXT.
+- Do not tell the user to "ask about Python instead" when they already asked a Python subtopic covered by the tags.
+
+DO NOT HALLUCINATE: only state what the retrieved text reasonably supports."""
+    
+    def __init__(self, api_key: str, model: str = "gpt-3.5-turbo", base_url: Optional[str] = None):
+        """
+        Args:
+            api_key: API key for the completion provider
+            model: Chat model id (OpenAI or Groq model name)
+            base_url: If set, OpenAI-compatible endpoint (e.g. Groq https://api.groq.com/openai/v1)
+        """
+        kwargs = {"api_key": api_key}
+        if base_url:
+            kwargs["base_url"] = base_url.rstrip("/")
+        self.client = OpenAI(**kwargs)
+        self.model = model
+        self.last_usage: Optional[Dict] = None
+    
+    def generate_response(
+        self,
+        query: str,
+        context_chunks: List[Dict],
+        chat_history: Optional[List[Dict]] = None,
+        system_prompt: Optional[str] = None,
+        available_technologies: Optional[List[str]] = None
+    ) -> str:
+        """
+        Generate response using LLM with context from vector search and chat history.
+        
+        Args:
+            query: User query
+            context_chunks: List of relevant chunks from vector search
+            chat_history: Optional list of previous messages [{"role": "user/assistant", "content": "..."}]
+            system_prompt: Optional custom system prompt
+            available_technologies: Optional list of available technologies/courses in the system
+            
+        Returns:
+            LLM generated response
+        """
+        if system_prompt is None:
+            system_prompt = self.DEFAULT_SYSTEM_PROMPT
+        
+        # Build context from chunks - filter out empty chunks
+        valid_chunks = [chunk for chunk in context_chunks if chunk.get('text', '').strip()]
+        print(f">>> LLM: Processing {len(valid_chunks)} valid chunks (out of {len(context_chunks)} total)", flush=True)
+        
+        if not valid_chunks:
+            return "I couldn't find any text content in the retrieved documents to answer your question."
+        
+        # Extract technologies present in context
+        technologies_in_context = set()
+        for chunk in valid_chunks:
+            tech = chunk.get('technology', 'unknown')
+            if tech and tech != 'unknown' and tech != 'general':
+                technologies_in_context.add(tech)
+        
+        def _format_raw_table(raw_table: Dict) -> str:
+            if not raw_table:
+                return ""
+            headers = raw_table.get("headers") or []
+            rows = raw_table.get("rows") or []
+            limited_rows = rows[:15]
+            table_lines = []
+            if headers:
+                table_lines.append(" | ".join([str(h) for h in headers]))
+            for r in limited_rows:
+                table_lines.append(" | ".join([str(c) for c in r]))
+            return "RAW TABLE:\n" + "\n".join(table_lines)
+
+        def _format_raw_code(raw_code: Dict) -> str:
+            if not raw_code:
+                return ""
+            code_text = raw_code.get("code_text") or ""
+            return "RAW CODE:\n" + _truncate_raw_code(code_text)
+
+        def _format_raw_image(raw_image: Dict) -> str:
+            if not raw_image:
+                return ""
+            caption = raw_image.get("caption") or ""
+            path = raw_image.get("image_path") or ""
+            return f"RAW IMAGE:\ncaption={caption}\npath={path}"
+
+        context_parts = []
+        for i, chunk in enumerate(valid_chunks):
+            base = f"[Document excerpt {i+1} - Technology: {chunk.get('technology', 'general')}]:\n{chunk.get('text', '').strip()}"
+            extra = []
+            if chunk.get("raw_table"):
+                extra.append(_format_raw_table(chunk.get("raw_table")))
+            if chunk.get("raw_code"):
+                extra.append(_format_raw_code(chunk.get("raw_code")))
+            if chunk.get("raw_image"):
+                extra.append(_format_raw_image(chunk.get("raw_image")))
+            if extra:
+                base = base + "\n\n" + "\n\n".join([e for e in extra if e])
+            context_parts.append(base)
+
+        context = "\n\n".join(context_parts)
+        
+        # Debug: Log context length
+        print(f">>> LLM: Total context length: {len(context)} characters", flush=True)
+        print(f">>> LLM: Technologies in context: {technologies_in_context}", flush=True)
+        print(f">>> LLM: Context preview: {context[:300]}...", flush=True)
+        
+        # Build messages array with proper structure:
+        # 1. System prompt
+        # 2. Chat history (if any)
+        # 3. Retrieved context + current question
+        
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        # Add chat history if provided (excluding the current query which we'll add with context)
+        if chat_history:
+            print(f">>> LLM: Including {len(chat_history)} messages from chat history", flush=True)
+            for msg in chat_history:
+                # Skip if this is the current query (we'll add it with context)
+                if msg["role"] == "user" and msg["content"].strip() == query.strip():
+                    continue
+                messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
+        
+        # Add current query with retrieved context - STRICT MODE WITH HELPFUL GUIDANCE
+        tech_list = ", ".join(sorted(technologies_in_context)) if technologies_in_context else "general/unknown"
+        
+        # Course-level labels from ingest — orientation only; subtopics (modules, classes, …) are still valid.
+        library_labels_text = ""
+        if available_technologies and len(available_technologies) > 0:
+            library_labels_text = f"""
+OTHER DOCUMENT LABELS IN YOUR LIBRARY (orientation only — not a checklist of allowed question phrases):
+{', '.join(available_technologies)}
+"""
+
+        user_prompt = f"""Answer using ONLY the RETRIEVED CONTEXT below (including RAW TABLE and RAW CODE sections).
+
+RETRIEVED CONTEXT:
+{context}
+
+Coarse document/course tags on chunks (not a list of allowed questions): {tech_list}
+{library_labels_text}
+QUESTION: {query}
+
+Instructions:
+1. Read ALL excerpts. Noisy or fragmented PDF text still counts—extract whatever clearly relates to the question.
+2. If any excerpt or raw block discusses the topic (e.g. scope: global/local/nonlocal/namespace/LEGB; modules: import/from/__name__/packages), answer from that material with clear structure (definitions + bullets + short examples taken from context).
+3. Do NOT say "context does not contain" or "ask about Python" when the tag is python and the question is a normal Python subtopic—unless the snippets truly have zero relevant content.
+4. Say you cannot answer from the documents ONLY if nothing in the retrieved text bears on the question.
+5. Do not add facts from training data that are not supported by the excerpts.
+
+Write the best answer the retrieved text allows."""
+        
+        messages.append({
+            "role": "user",
+            "content": user_prompt
+        })
+        
+        # Debug: Log message structure
+        print(f">>> LLM: Total messages being sent to LLM: {len(messages)}", flush=True)
+        
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.3,  # Lower temperature for more deterministic, context-focused responses
+            max_tokens=900,
+        )
+        try:
+            usage = getattr(response, "usage", None)
+            if usage:
+                # prompt_tokens / completion_tokens / total_tokens (OpenAI-compatible)
+                self.last_usage = {
+                    "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                    "completion_tokens": getattr(usage, "completion_tokens", None),
+                    "total_tokens": getattr(usage, "total_tokens", None),
+                }
+            else:
+                self.last_usage = None
+        except Exception:
+            self.last_usage = None
+
+        return response.choices[0].message.content.strip()
+    
+    def generate_response_simple(
+        self,
+        messages: List[Dict],
+        temperature: float = 0.7,
+        max_tokens: int = 500
+    ) -> str:
+        """
+        Generate response with raw messages (for custom use cases).
+        
+        Args:
+            messages: List of messages in OpenAI format
+            temperature: Sampling temperature
+            max_tokens: Maximum tokens in response
+            
+        Returns:
+            LLM generated response
+        """
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+        
+        return response.choices[0].message.content.strip()
+
+    def is_context_sufficient(
+        self,
+        query: str,
+        context_chunks: List[Dict],
+        max_chunks: int = 5,
+        max_chars_per_chunk: int = 400
+    ) -> bool:
+        """
+        Check if retrieved context is sufficient to answer the query.
+        Returns True/False based on LLM judgment.
+        """
+        if not query or not query.strip():
+            return False
+        if not context_chunks:
+            return False
+
+        # Heuristic: if question asks for examples/code/syntax, require example-like text in context
+        q = query.lower()
+        wants_examples = any(
+            kw in q for kw in (
+                "example", "examples", "sample", "code", "syntax", "implementation", "demo"
+            )
+        )
+        if wants_examples:
+            example_markers = ("example", "for example", "e.g.", "eg.", "sample", "code", "syntax")
+            has_example = False
+            for c in context_chunks[:max_chunks]:
+                t = (c.get("text") or "").lower()
+                if any(m in t for m in example_markers):
+                    has_example = True
+                    break
+            if not has_example:
+                return False
+
+        # Build a compact context excerpt for evaluation
+        excerpts = []
+        for c in context_chunks[:max_chunks]:
+            text = (c.get("text") or "").strip()
+            if not text:
+                continue
+            excerpts.append(text[:max_chars_per_chunk])
+
+        if not excerpts:
+            return False
+
+        context = "\n\n".join(f"[Excerpt {i+1}] {t}" for i, t in enumerate(excerpts))
+
+        prompt = f"""You evaluate PDF snippets for a tutor chatbot. Text may be OCR-noisy or fragmented.
+
+Answer "yes" if ANY excerpt could help answer the question even partially (same course/subject, related terms,
+code, or tables). Answer "no" only if excerpts are clearly off-topic or empty of usable content.
+
+Question: {query.strip()}
+
+Retrieved excerpts:
+{context}
+
+Answer only "yes" or "no"."""
+
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=3
+        )
+
+        text = (response.choices[0].message.content or "").strip().lower()
+        return text.startswith("y")
+
+    def rewrite_query(
+        self,
+        query: str,
+        chat_history: Optional[List[Dict]] = None
+    ) -> str:
+        """
+        Rewrite a user query into a better retrieval query.
+        Returns the rewritten query string; falls back to original on failure.
+        """
+        if not query or not query.strip():
+            return query
+
+        history_block = ""
+        if chat_history:
+            # Use the last few messages for context (short)
+            recent = chat_history[-4:]
+            history_lines = []
+            for m in recent:
+                role = m.get("role", "user")
+                content = (m.get("content") or "").strip()
+                if content:
+                    history_lines.append(f"{role}: {content}")
+            if history_lines:
+                history_block = "\nRecent conversation:\n" + "\n".join(history_lines) + "\n"
+
+        prompt = f"""Rewrite the user question into a concise, retrieval-optimized query.
+Keep the same intent, add missing specifics and likely keywords.
+Do not answer the question.
+Return JSON with a single key: "rewrite_query".
+
+{history_block}User question: {query.strip()}
+
+Example output:
+{{"rewrite_query": "Explain Java HashMap internal working with examples"}}"""
+
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=120
+        )
+
+        text = (response.choices[0].message.content or "").strip()
+        if not text:
+            return query
+
+        # Try to parse JSON if present
+        try:
+            match = re.search(r"\{.*\}", text, re.DOTALL)
+            if match:
+                data = json.loads(match.group(0))
+                rewritten = (data.get("rewrite_query") or "").strip()
+                return rewritten if rewritten else query
+        except Exception:
+            pass
+
+        # Fallback: return raw text (first line)
+        first_line = text.splitlines()[0].strip()
+        return first_line if first_line else query

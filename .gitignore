@@ -1,0 +1,57 @@
+# Bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+*.cover
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment (keep secrets out of git)
+.env
+.env.*
+# Local-only; tracked template is env.example (copy to .env)
+.env.example
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Local DB & app data (SQLite fallback)
+data/
+*.db
+
+# Uploaded PDFs and extracted images (local only)
+uploads/
+
+# Logs & temp
+*.log
+tmp/
+temp/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Legacy / local state
+app/document_registry.json
