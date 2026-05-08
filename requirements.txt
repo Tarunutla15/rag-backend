@@ -1,8 +1,9 @@
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 python-multipart==0.0.6
-pydantic==2.5.0
-pydantic-settings==2.1.0
+# 2.5.x pins pydantic-core 2.14.1 — no wheel on Python 3.14 (pip tries Rust/maturin → fails on Render).
+pydantic>=2.10.0,<3
+pydantic-settings>=2.6.0,<3
 openai>=1.12.0
 langchain==0.0.350
 PyPDF2==3.0.1

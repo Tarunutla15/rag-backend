@@ -1,0 +1,13 @@
+# Render Blueprint — ensures Python 3.12 (3.14 defaults break pydantic-core without Rust).
+# Dashboard: https://render.com/docs/python-version
+# Either deploy via Blueprint, or set PYTHON_VERSION=3.12.8 on an existing Web Service.
+services:
+  - type: web
+    name: rag-backend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
