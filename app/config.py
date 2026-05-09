@@ -19,6 +19,17 @@ class Settings(BaseSettings):
     GROQ_API_KEY: Optional[str] = None
     GROQ_API_BASE: Optional[str] = None
     GROQ_MODEL: Optional[str] = None
+    # Groq on-demand tier enforces low TPM; oversized prompts return 413 / rate_limit_exceeded.
+    # Total prompt ≈ system + history + retrieved context — keep context+history bounded (~4 chars ≈ 1 token).
+    GROQ_MAX_CONTEXT_CHARS: int = 16000
+    GROQ_MAX_CHAT_HISTORY_CHARS: int = 4000
+    GROQ_MAX_CHARS_PER_CHUNK: int = 3200
+    GROQ_RERANK_MAX_CHUNKS: int = 14
+    GROQ_RERANK_SNIPPET_CHARS: int = 900
+    # USD per 1M tokens for dashboard cost when LLM_PROVIDER=groq (defaults ≈ Groq on-demand
+    # llama-3.3-70b-versatile; see https://groq.com/pricing — override if you use another model/tier).
+    GROQ_INPUT_USD_PER_1M: float = 0.59
+    GROQ_OUTPUT_USD_PER_1M: float = 0.79
 
     # Optional cost config (USD per 1M tokens). If unset, cost logging is skipped.
     # Provide these in .env if you want cost estimates in logs.

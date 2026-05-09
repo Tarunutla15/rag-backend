@@ -99,6 +99,23 @@ CREATE TABLE IF NOT EXISTS chunks_fts (
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_fts_document_id ON chunks_fts(document_id);
 
+-- LLM usage / dashboard (token counts per chat completion)
+CREATE TABLE IF NOT EXISTS usage_events (
+    id BIGSERIAL PRIMARY KEY,
+    session_id TEXT,
+    message_id BIGINT,
+    event_type TEXT NOT NULL DEFAULT 'chat_completion',
+    query_preview TEXT,
+    prompt_tokens INT,
+    completion_tokens INT,
+    total_tokens INT,
+    model TEXT,
+    provider TEXT,
+    cost_usd DOUBLE PRECISION,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_usage_events_created ON usage_events(created_at DESC);
+
 -- ============================================================
 -- OPTIONAL: RESET / CLEAR ALL APP DATA (keeps schema)
 -- ============================================================

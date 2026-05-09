@@ -46,3 +46,8 @@ CREATE POLICY "Allow all for anon" ON raw_images FOR ALL TO anon USING (true) WI
 ALTER TABLE chunks_fts ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Allow all for anon" ON chunks_fts;
 CREATE POLICY "Allow all for anon" ON chunks_fts FOR ALL TO anon USING (true) WITH CHECK (true);
+
+-- usage_events (LLM token / dashboard)
+ALTER TABLE usage_events ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Allow all for anon" ON usage_events;
+CREATE POLICY "Allow all for anon" ON usage_events FOR ALL TO anon USING (true) WITH CHECK (true);

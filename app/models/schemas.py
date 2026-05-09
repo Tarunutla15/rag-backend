@@ -102,3 +102,33 @@ class DocumentInfo(BaseModel):
     updated_at: Optional[str] = None
     pdf_path: Optional[str] = None
 
+
+# ==================== USAGE / DASHBOARD ====================
+
+
+class UsageSummary(BaseModel):
+    chat_completions: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    estimated_cost_usd: Optional[float] = None
+
+
+class UsageEventItem(BaseModel):
+    id: Optional[int] = None
+    session_id: Optional[str] = None
+    query_preview: str = ""
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    model: Optional[str] = None
+    provider: Optional[str] = None
+    cost_usd: Optional[float] = None
+    created_at: str = ""
+
+
+class DashboardUsageResponse(BaseModel):
+    days: int
+    summary: UsageSummary
+    recent: List[UsageEventItem]
+

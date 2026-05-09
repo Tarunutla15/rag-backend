@@ -228,6 +228,25 @@ def _ensure_supabase_tables_via_postgres(db_url: str) -> bool:
             )
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_fts_document_id ON chunks_fts(document_id)")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS usage_events (
+                id BIGSERIAL PRIMARY KEY,
+                session_id TEXT,
+                message_id BIGINT,
+                event_type TEXT NOT NULL DEFAULT 'chat_completion',
+                query_preview TEXT,
+                prompt_tokens INT,
+                completion_tokens INT,
+                total_tokens INT,
+                model TEXT,
+                provider TEXT,
+                cost_usd DOUBLE PRECISION,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_usage_events_created ON usage_events(created_at DESC)"
+        )
         conn.commit()
         cur.close()
         conn.close()
@@ -260,6 +279,40 @@ class Database:
                 self.supabase = create_client(supabase_url.strip(), supabase_key.strip())
                 self.supabase.table("chat_sessions").select("id").limit(1).execute()
                 self.engine = "supabase"
+                # usage_events was added after many deployments; ensure table exists without full reconnect failure
+                try:
+                    self.supabase.table("usage_events").select("id").limit(1).execute()
+                except Exception as ue_e:
+                    ue_str = str(ue_e)
+                    missing_usage = (
+                        _is_table_not_found_error(ue_e)
+                        or "PGRST205" in ue_str
+                        or (
+                            "usage_events" in ue_str.lower()
+                            and ("could not find" in ue_str.lower() or "schema cache" in ue_str.lower())
+                        )
+                    )
+                    if missing_usage and supabase_db_url and _ensure_supabase_tables_via_postgres(supabase_db_url):
+                        time.sleep(2)
+                        try:
+                            self.supabase.table("usage_events").select("id").limit(1).execute()
+                            logger.info("usage_events table ensured (PostgreSQL migration)")
+                        except Exception as retry_e:
+                            logger.warning(
+                                "usage_events still unavailable after schema ensure: %s. "
+                                "Run the usage_events block in backend/supabase_schema.sql in Supabase SQL Editor, "
+                                "or set SUPABASE_DB_URL for automatic CREATE TABLE.",
+                                retry_e,
+                            )
+                    elif missing_usage:
+                        logger.warning(
+                            "Supabase is missing public.usage_events (token dashboard will stay empty). "
+                            "Set SUPABASE_DB_URL (Pooler) so the API can run CREATE TABLE, or execute the "
+                            "usage_events section of backend/supabase_schema.sql in the Supabase SQL Editor, "
+                            "then add RLS for usage_events from backend/supabase_rls_policies.sql if you use the anon key."
+                        )
+                    else:
+                        logger.warning("usage_events check failed (non-fatal): %s", ue_e)
                 logger.info("Database initialized (Supabase REST API)")
                 return
             except Exception as e:
@@ -400,6 +453,25 @@ class Database:
                 technology UNINDEXED, domain UNINDEXED, chunk_index UNINDEXED, file_id UNINDEXED
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS usage_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                message_id INTEGER,
+                event_type TEXT NOT NULL DEFAULT 'chat_completion',
+                query_preview TEXT,
+                prompt_tokens INTEGER,
+                completion_tokens INTEGER,
+                total_tokens INTEGER,
+                model TEXT,
+                provider TEXT,
+                cost_usd REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_usage_events_created ON usage_events(created_at DESC)"
+        )
 
 
 _db: Optional[Database] = None

@@ -2,7 +2,12 @@
 from openai import OpenAI
 from typing import List, Dict, Optional
 import json
+import logging
 import re
+
+from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 # Cap for RAW CODE sent to the LLM (line-boundary truncation below this size avoids mid-token cuts).
 RAW_CODE_MAX_CHARS = 8000
@@ -22,6 +27,23 @@ def _truncate_raw_code(text: str, max_chars: int = RAW_CODE_MAX_CHARS) -> str:
         parts.append(line)
         total += add_len
     return "\n".join(parts) + f"\n... [truncated, {len(text)} chars total]"
+
+
+def _is_groq_provider() -> bool:
+    return (getattr(settings, "LLM_PROVIDER", "") or "").lower().strip() == "groq"
+
+
+def _trim_chat_history_for_budget(messages: List[Dict], max_chars: int) -> List[Dict]:
+    """Drop oldest turns until total content length is under max_chars (keeps recent context)."""
+    if max_chars <= 0 or not messages:
+        return messages
+    trimmed = list(messages)
+    while trimmed:
+        total = sum(len((m.get("content") or "")) for m in trimmed)
+        if total <= max_chars:
+            return trimmed
+        trimmed = trimmed[1:]
+    return trimmed
 
 
 class LLMService:
@@ -96,7 +118,21 @@ DO NOT HALLUCINATE: only state what the retrieved text reasonably supports."""
         
         if not valid_chunks:
             return "I couldn't find any text content in the retrieved documents to answer your question."
-        
+
+        valid_chunks = sorted(
+            valid_chunks,
+            key=lambda c: float(c.get("score") or c.get("hybrid_score") or 0.0),
+            reverse=True,
+        )
+
+        max_context_chars: Optional[int] = None
+        max_per_chunk: Optional[int] = None
+        max_history_chars: Optional[int] = None
+        if _is_groq_provider():
+            max_context_chars = max(4000, int(getattr(settings, "GROQ_MAX_CONTEXT_CHARS", 16000)))
+            max_per_chunk = max(500, int(getattr(settings, "GROQ_MAX_CHARS_PER_CHUNK", 3200)))
+            max_history_chars = max(0, int(getattr(settings, "GROQ_MAX_CHAT_HISTORY_CHARS", 4000)))
+
         # Extract technologies present in context
         technologies_in_context = set()
         for chunk in valid_chunks:
@@ -130,9 +166,17 @@ DO NOT HALLUCINATE: only state what the retrieved text reasonably supports."""
             path = raw_image.get("image_path") or ""
             return f"RAW IMAGE:\ncaption={caption}\npath={path}"
 
-        context_parts = []
-        for i, chunk in enumerate(valid_chunks):
-            base = f"[Document excerpt {i+1} - Technology: {chunk.get('technology', 'general')}]:\n{chunk.get('text', '').strip()}"
+        context_parts: List[str] = []
+        running = 0
+        chunk_index = 0
+        for chunk in valid_chunks:
+            body = (chunk.get("text") or "").strip()
+            if max_per_chunk and len(body) > max_per_chunk:
+                body = body[:max_per_chunk] + "\n... [excerpt truncated for provider token limits]"
+            chunk_index += 1
+            base = (
+                f"[Document excerpt {chunk_index} - Technology: {chunk.get('technology', 'general')}]:\n{body}"
+            )
             extra = []
             if chunk.get("raw_table"):
                 extra.append(_format_raw_table(chunk.get("raw_table")))
@@ -142,9 +186,27 @@ DO NOT HALLUCINATE: only state what the retrieved text reasonably supports."""
                 extra.append(_format_raw_image(chunk.get("raw_image")))
             if extra:
                 base = base + "\n\n" + "\n\n".join([e for e in extra if e])
+            piece_len = len(base) + 4
+            if max_context_chars is not None and running + piece_len > max_context_chars:
+                if not context_parts:
+                    base = base[: max_context_chars - 200] + "\n... [truncated]"
+                    context_parts.append(base)
+                    logger.warning(
+                        "LLM: Groq context budget exceeded on first chunk; hard-truncated (raise GROQ_MAX_CONTEXT_CHARS if needed)"
+                    )
+                else:
+                    logger.warning(
+                        "LLM: stopping at %s excerpt(s) for Groq context cap (~%s chars)",
+                        len(context_parts),
+                        max_context_chars,
+                    )
+                break
             context_parts.append(base)
+            running += piece_len
 
         context = "\n\n".join(context_parts)
+        if max_context_chars is not None and len(context_parts) < len(valid_chunks):
+            context += "\n\n[Note: additional retrieved excerpts were omitted to fit the model provider token limits.]"
         
         # Debug: Log context length
         print(f">>> LLM: Total context length: {len(context)} characters", flush=True)
@@ -159,9 +221,12 @@ DO NOT HALLUCINATE: only state what the retrieved text reasonably supports."""
         messages = [{"role": "system", "content": system_prompt}]
         
         # Add chat history if provided (excluding the current query which we'll add with context)
-        if chat_history:
-            print(f">>> LLM: Including {len(chat_history)} messages from chat history", flush=True)
-            for msg in chat_history:
+        history_src = chat_history or []
+        if max_history_chars is not None and history_src:
+            history_src = _trim_chat_history_for_budget(list(history_src), max_history_chars)
+        if history_src:
+            print(f">>> LLM: Including {len(history_src)} messages from chat history", flush=True)
+            for msg in history_src:
                 # Skip if this is the current query (we'll add it with context)
                 if msg["role"] == "user" and msg["content"].strip() == query.strip():
                     continue
@@ -207,11 +272,15 @@ Write the best answer the retrieved text allows."""
         # Debug: Log message structure
         print(f">>> LLM: Total messages being sent to LLM: {len(messages)}", flush=True)
         
+        completion_max = 900
+        if _is_groq_provider():
+            completion_max = min(completion_max, 768)
+
         response = self.client.chat.completions.create(
             model=self.model,
             messages=messages,
             temperature=0.3,  # Lower temperature for more deterministic, context-focused responses
-            max_tokens=900,
+            max_tokens=completion_max,
         )
         try:
             usage = getattr(response, "usage", None)

@@ -17,6 +17,7 @@ from app.services.reranker import RerankerService
 from app.services.keyword_search import get_keyword_search_service
 from app.services.chunk_store import get_chunk_store
 from app.services.raw_block_store import get_raw_block_store
+from app.services.usage_store import record_chat_completion
 import json
 
 # Reuse vector store getter from upload route to avoid duplicate init logic
@@ -44,10 +45,8 @@ def get_embedding_service() -> EmbeddingService:
 def get_llm_service() -> LLMService:
     global _llm_service
     if _llm_service is None:
-        _llm_service = LLMService(
-            api_key=settings.OPENAI_API_KEY,
-            model=settings.OPENAI_MODEL,
-        )
+        key, model, base_url = get_completion_client_config()
+        _llm_service = LLMService(api_key=key, model=model, base_url=base_url)
     return _llm_service
 
 
@@ -143,30 +142,41 @@ def _retrieve_context_chunks(
         context_chunks = []
         reranker = get_reranker_service() if enable_reranker else None
         per_tech_top_n = max(1, rerank_top_n)
-        for tech in technologies:
-            tech_domain = QueryClassifier.TECHNOLOGY_TO_DOMAIN.get(tech, "general")
-            vector_results = vector_store.search(
+        scoped_doc = request.file_id
+
+        def _hybrid_merged(tech: str, dom: Optional[str]) -> tuple[list, list, list]:
+            vr = vector_store.search(
                 query_embedding=query_embedding,
                 top_k=initial_top_k,
                 technology=tech,
-                domain=tech_domain,
+                domain=dom,
                 document_id=request.file_id,
                 file_id=request.file_id,
                 query_text=search_query,
             )
-            keyword_results = []
+            kr = []
             if enable_keyword and keyword_service:
-                keyword_results = keyword_service.search(
+                kr = keyword_service.search(
                     query=search_query,
                     top_k=keyword_top_k,
                     technology=tech,
-                    domain=tech_domain,
+                    domain=dom,
                     document_id=request.file_id,
                     file_id=request.file_id,
                 )
-            merged = _merge_hybrid_results(
-                vector_results, keyword_results, vector_weight, keyword_weight
-            )
+            merged = _merge_hybrid_results(vr, kr, vector_weight, keyword_weight)
+            return vr, kr, merged
+
+        for tech in technologies:
+            tech_domain = QueryClassifier.TECHNOLOGY_TO_DOMAIN.get(tech, "general")
+            vector_results, keyword_results, merged = _hybrid_merged(tech, tech_domain)
+            if not merged and scoped_doc:
+                vector_results, keyword_results, merged = _hybrid_merged(tech, None)
+                if merged:
+                    logger.info(
+                        ">>> RETRIEVAL: technology=%s using domain-agnostic filter (ingest domain != query routing)",
+                        tech,
+                    )
             logger.info(
                 ">>> RETRIEVAL: technology=%s vector=%s keyword=%s merged=%s",
                 tech, len(vector_results), len(keyword_results), len(merged)
@@ -178,6 +188,45 @@ def _retrieve_context_chunks(
             else:
                 kept = merged[:per_tech_top_n]
             context_chunks.extend(kept)
+        # Chunks are stored with document-level tech/domain; query routing may use java+backend while ingest used general
+        if not context_chunks and scoped_doc:
+            wide_top = max(initial_top_k * 2, rerank_top_n * 4)
+            logger.info(
+                ">>> RETRIEVAL: multi-tech still empty; document-wide search document_id=%s (no tech/domain filter)",
+                scoped_doc,
+            )
+            vr_w = vector_store.search(
+                query_embedding=query_embedding,
+                top_k=wide_top,
+                technology=None,
+                domain=None,
+                document_id=scoped_doc,
+                file_id=scoped_doc,
+                query_text=search_query,
+            )
+            kr_w = []
+            if enable_keyword and keyword_service:
+                kr_w = keyword_service.search(
+                    query=search_query,
+                    top_k=max(keyword_top_k, wide_top),
+                    technology=None,
+                    domain=None,
+                    document_id=scoped_doc,
+                    file_id=scoped_doc,
+                )
+            merged_wide = _merge_hybrid_results(vr_w, kr_w, vector_weight, keyword_weight)
+            logger.info(
+                ">>> RETRIEVAL: document-wide vector=%s keyword=%s merged=%s",
+                len(vr_w), len(kr_w), len(merged_wide),
+            )
+            if merged_wide:
+                if enable_reranker and len(merged_wide) > rerank_top_n and reranker:
+                    context_chunks = reranker.rerank(query=rerank_query, chunks=merged_wide, top_n=rerank_top_n)
+                elif len(merged_wide) > rerank_top_n:
+                    merged_wide.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+                    context_chunks = merged_wide[:rerank_top_n]
+                else:
+                    context_chunks = merged_wide
         # One global rerank across technologies so ordering is not biased by tech loop order
         if enable_reranker and reranker and len(context_chunks) > rerank_top_n:
             context_chunks = reranker.rerank(
@@ -197,6 +246,7 @@ def _retrieve_context_chunks(
         enable_reranker,
         rerank_top_n if enable_reranker else "n/a",
     )
+    scoped_doc = request.file_id
     vector_results = vector_store.search(
         query_embedding=query_embedding,
         top_k=initial_top_k if enable_reranker else max_chunks_no_rerank,
@@ -217,6 +267,56 @@ def _retrieve_context_chunks(
             file_id=request.file_id,
         )
     merged = _merge_hybrid_results(vector_results, keyword_results, vector_weight, keyword_weight)
+    if not merged and scoped_doc and domain:
+        vector_results = vector_store.search(
+            query_embedding=query_embedding,
+            top_k=initial_top_k if enable_reranker else max_chunks_no_rerank,
+            technology=technology,
+            domain=None,
+            document_id=request.file_id,
+            file_id=request.file_id,
+            query_text=search_query,
+        )
+        keyword_results = []
+        if enable_keyword and keyword_service:
+            keyword_results = keyword_service.search(
+                query=search_query,
+                top_k=keyword_top_k,
+                technology=technology,
+                domain=None,
+                document_id=request.file_id,
+                file_id=request.file_id,
+            )
+        merged = _merge_hybrid_results(vector_results, keyword_results, vector_weight, keyword_weight)
+        if merged:
+            logger.info(">>> RETRIEVAL: single-scope fallback omit domain filter (scoped doc)")
+    if not merged and scoped_doc and technology:
+        wide_top = max(
+            (initial_top_k if enable_reranker else max_chunks_no_rerank) * 2,
+            rerank_top_n * 4,
+        )
+        vector_results = vector_store.search(
+            query_embedding=query_embedding,
+            top_k=wide_top,
+            technology=None,
+            domain=None,
+            document_id=scoped_doc,
+            file_id=scoped_doc,
+            query_text=search_query,
+        )
+        keyword_results = []
+        if enable_keyword and keyword_service:
+            keyword_results = keyword_service.search(
+                query=search_query,
+                top_k=max(keyword_top_k, wide_top),
+                technology=None,
+                domain=None,
+                document_id=scoped_doc,
+                file_id=scoped_doc,
+            )
+        merged = _merge_hybrid_results(vector_results, keyword_results, vector_weight, keyword_weight)
+        if merged:
+            logger.info(">>> RETRIEVAL: single-scope document-wide search (technology labels mismatch ingest)")
     logger.info(
         ">>> RETRIEVAL: vector=%s keyword=%s merged=%s",
         len(vector_results), len(keyword_results), len(merged)
@@ -718,11 +818,20 @@ async def chat(request: ChatRequest):
 
     cost_usd = None
     try:
-        if provider == "openai" and prompt_toks is not None and completion_toks is not None:
-            in_rate = getattr(settings, "OPENAI_INPUT_USD_PER_1M", None)
-            out_rate = getattr(settings, "OPENAI_OUTPUT_USD_PER_1M", None)
-            if in_rate is not None and out_rate is not None:
-                cost_usd = (float(prompt_toks) / 1_000_000.0) * float(in_rate) + (float(completion_toks) / 1_000_000.0) * float(out_rate)
+        if prompt_toks is not None and completion_toks is not None:
+            if provider == "openai":
+                in_rate = getattr(settings, "OPENAI_INPUT_USD_PER_1M", None)
+                out_rate = getattr(settings, "OPENAI_OUTPUT_USD_PER_1M", None)
+                if in_rate is not None and out_rate is not None:
+                    cost_usd = (float(prompt_toks) / 1_000_000.0) * float(in_rate) + (
+                        float(completion_toks) / 1_000_000.0
+                    ) * float(out_rate)
+            elif provider == "groq":
+                in_rate = float(getattr(settings, "GROQ_INPUT_USD_PER_1M", 0.59))
+                out_rate = float(getattr(settings, "GROQ_OUTPUT_USD_PER_1M", 0.79))
+                cost_usd = (float(prompt_toks) / 1_000_000.0) * in_rate + (
+                    float(completion_toks) / 1_000_000.0
+                ) * out_rate
     except Exception:
         cost_usd = None
 
@@ -736,6 +845,18 @@ async def chat(request: ChatRequest):
         completion_toks,
         total_toks,
         f"{cost_usd:.6f}" if isinstance(cost_usd, (int, float)) else None,
+    )
+
+    record_chat_completion(
+        session_id=session_id,
+        message_id=assistant_row.get("id"),
+        query_preview=query,
+        prompt_tokens=prompt_toks,
+        completion_tokens=completion_toks,
+        total_tokens=total_toks,
+        model=model_used,
+        provider=provider or "openai",
+        cost_usd=float(cost_usd) if isinstance(cost_usd, (int, float)) else None,
     )
 
     # Sources from retrieved chunks (e.g. file names / technologies)

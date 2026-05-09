@@ -7,6 +7,7 @@ from app.api.routes import upload as upload_routes
 from app.api.routes import chat as chat_routes
 from app.api.routes import sessions as sessions_routes
 from app.api.routes import documents as documents_routes
+from app.api.routes import dashboard as dashboard_routes
 from app.models.schemas import HealthResponse
 import logging
 import traceback
@@ -97,6 +98,8 @@ app.include_router(sessions_routes.router)
 print("INFO: Sessions router registered")
 app.include_router(documents_routes.router)
 print("INFO: Documents router registered")
+app.include_router(dashboard_routes.router)
+print("INFO: Dashboard router registered")
 print("INFO: All routes registered successfully")
 
 
