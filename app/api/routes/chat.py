@@ -133,7 +133,13 @@ def _retrieve_context_chunks(
     rerank_top_n: int,
     max_chunks_no_rerank: int,
 ) -> list:
-    """Retrieve and (optionally) rerank context chunks."""
+    """
+    Retrieve and (optionally) rerank context chunks.
+
+    Vector search uses ``VectorStore.search`` (``vector_store.py``): that queries **all three**
+    Zilliz collections (``{base}_text_chunks``, ``{base}_code_blocks``, ``{base}_tables``),
+    merges results, then returns the top-k combined hits — not a single flat collection.
+    """
     query_embedding = embedding_service.generate_embedding(search_query)
 
     # Balanced retrieval when scope has 2+ technologies
@@ -438,6 +444,81 @@ def _merge_hybrid_results(
     return merged_list
 
 
+def _query_seeks_figure_or_image(query: str) -> bool:
+    """True when user likely wants to see a diagram/figure file, not only text."""
+    q = (query or "").lower()
+    if not q.strip():
+        return False
+    visual = (
+        "image", "figure", "diagram", "picture", "chart", "graph", "plot",
+        "screenshot", "illustration", "show me", "see the", "view the",
+        "display the", "can i see",
+    )
+    if not any(v in q for v in visual):
+        return False
+    return True
+
+
+def _maybe_supplement_image_caption_chunks(
+    context_chunks: list,
+    query: str,
+    scope_file_ids: list,
+    technologies: list,
+) -> list:
+    """
+    Vector search often ranks text above image_caption chunks. When the user asks to *see* a figure,
+    pull image_caption rows from the chunk store for scoped documents so RAW IMAGE + view_url reach the LLM.
+    """
+    if not _query_seeks_figure_or_image(query):
+        return context_chunks
+
+    chunk_store = get_chunk_store()
+    seen = {c.get("chunk_id") for c in context_chunks if c.get("chunk_id")}
+    doc_candidates: list = []
+    if scope_file_ids:
+        doc_candidates = list(scope_file_ids)
+    else:
+        doc_candidates = list({c.get("document_id") for c in context_chunks if c.get("document_id")})
+        doc_candidates = doc_candidates[:10]
+    if len(doc_candidates) > 8:
+        doc_candidates = doc_candidates[:8]
+
+    tech_fallback = technologies[0] if len(technologies) == 1 else None
+    added: list = []
+    per_doc = 15
+    for did in doc_candidates:
+        if not did:
+            continue
+        try:
+            rows = chunk_store.list_chunks_by_type(did, "image_caption", limit=per_doc)
+        except Exception as e:
+            logger.warning(">>> RETRIEVAL: list image_caption chunks failed doc=%s: %s", did[:8], e)
+            continue
+        for row in rows:
+            cid = row.get("chunk_id")
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            mjson = row.get("metadata_json") or "{}"
+            added.append({
+                "text": row.get("retrieval_text") or "",
+                "chunk_id": cid,
+                "document_id": did,
+                "chunk_type": "image_caption",
+                "metadata_json": mjson,
+                "page_number": row.get("page_number", -1),
+                "section_title": row.get("section_title", ""),
+                "technology": tech_fallback or "general",
+                "domain": None,
+                "score": 0.55,
+                "hybrid_score": 0.55,
+            })
+    if not added:
+        return context_chunks
+    logger.info(">>> RETRIEVAL: supplemented %s image_caption chunks for figure/image query", len(added))
+    return list(context_chunks) + added
+
+
 def _hydrate_chunks(context_chunks: list) -> list:
     """
     Enrich chunks with metadata, chunk_type, and raw table/code/image content.
@@ -483,7 +564,14 @@ def _hydrate_chunks(context_chunks: list) -> list:
         elif chunk_type == "image_caption":
             raw_id = meta.get("raw_image_id")
             if raw_id:
-                c["raw_image"] = raw_store.get_image(raw_id)
+                img = raw_store.get_image(raw_id)
+                if img:
+                    img = dict(img)
+                    did = img.get("document_id")
+                    iid = img.get("image_id")
+                    if did and iid:
+                        img["view_url"] = f"/documents/{did}/images/{iid}"
+                    c["raw_image"] = img
 
     return context_chunks
 
@@ -768,6 +856,11 @@ async def chat(request: ChatRequest):
                         len(scope_file_ids),
                         len(context_chunks),
                     )
+
+    # Ensure figure requests get image_caption chunks (with viewable URLs), not only text hits
+    context_chunks = _maybe_supplement_image_caption_chunks(
+        context_chunks, query, scope_file_ids, technologies
+    )
 
     # Hydrate chunks with raw data (tables/code/images)
     context_chunks = _hydrate_chunks(context_chunks)

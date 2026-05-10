@@ -21,6 +21,7 @@ from app.services.pdf_processor import PDFProcessor
 from app.services.chunking import ChunkingService
 from app.services.embedding import EmbeddingService
 from app.api.routes.upload import get_vector_store, best_effort_clear_failed_ingest
+from app.services.image_caption_enrichment import enrich_image_blocks_for_search
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,31 @@ async def get_document_pdf(document_id: str):
     )
 
 
+@router.get("/{document_id}/images/{image_id}")
+async def get_document_extracted_image(document_id: str, image_id: str):
+    """
+    Serve a cropped figure saved during ingest (uploads/images/{document_id}/...).
+    Used by chat answers as ![caption](/documents/{document_id}/images/{image_id}).
+    """
+    row = get_raw_block_store().get_image(image_id)
+    if not row or row.get("document_id") != document_id:
+        raise HTTPException(status_code=404, detail="Image not found for this document")
+    path_str = row.get("image_path") or ""
+    if not path_str.strip():
+        raise HTTPException(status_code=404, detail="Image has no file path")
+    p = Path(path_str).resolve()
+    upload_root = Path(settings.UPLOAD_DIR).resolve()
+    try:
+        p.relative_to(upload_root)
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Invalid image path")
+    if not p.is_file():
+        raise HTTPException(status_code=404, detail="Image file not on disk")
+    ext = p.suffix.lower()
+    media = "image/png" if ext == ".png" else "image/jpeg" if ext in (".jpg", ".jpeg") else "application/octet-stream"
+    return FileResponse(path=str(p), media_type=media, filename=p.name)
+
+
 @router.post("/{document_id}/replace", response_model=UploadResponse)
 async def replace_document(document_id: str, file: UploadFile = File(...)):
     """
@@ -232,6 +258,17 @@ async def replace_document(document_id: str, file: UploadFile = File(...)):
         embedding_service = EmbeddingService(api_key=settings.OPENAI_API_KEY, model=settings.OPENAI_EMBEDDING_MODEL)
 
         blocks = pdf_processor.extract_blocks(str(pdf_path))
+        if getattr(settings, "STORE_EXTRACTED_IMAGES", True):
+            try:
+                PDFProcessor.persist_extracted_images(
+                    str(pdf_path), document_id, blocks, settings.UPLOAD_DIR
+                )
+            except Exception as img_err:
+                logger.warning("persist_extracted_images during replace failed: %s", img_err)
+        try:
+            enrich_image_blocks_for_search(blocks)
+        except Exception as cap_err:
+            logger.warning("Image vision caption enrichment failed (non-fatal): %s", cap_err)
 
         # classify (tech/domain) and store back to registry
         sample_text = ""

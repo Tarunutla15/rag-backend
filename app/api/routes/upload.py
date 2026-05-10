@@ -18,6 +18,7 @@ from app.services.document_classifier import get_document_classifier
 from app.services.keyword_search import get_keyword_search_service
 from app.services.chunk_store import get_chunk_store
 from app.services.raw_block_store import get_raw_block_store
+from app.services.image_caption_enrichment import enrich_image_blocks_for_search
 
 logger = logging.getLogger(__name__)
 
@@ -313,6 +314,10 @@ async def upload_pdf(file: UploadFile = File(...)):
                 )
             except Exception as img_err:
                 logger.warning(f"Image extraction/persist failed: {img_err}")
+        try:
+            enrich_image_blocks_for_search(blocks)
+        except Exception as cap_err:
+            logger.warning("Image vision caption enrichment failed (non-fatal): %s", cap_err)
         print(f">>> STEP 5 DONE: Extracted {len(blocks)} blocks", flush=True)
 
         # STEP 5b: Classify document for technology/domain (same as batch)
@@ -578,6 +583,10 @@ async def upload_batch_pdfs(files: List[UploadFile] = File(...)):
                     )
                 except Exception as img_err:
                     logger.warning(f"Image extraction failed for {file.filename}: {img_err}")
+            try:
+                enrich_image_blocks_for_search(blocks)
+            except Exception as cap_err:
+                logger.warning("Image vision caption enrichment failed (non-fatal): %s", cap_err)
             text = pdf_processor.extract_text(str(file_path))
             print(f">>> Extracted {len(text)} characters, {len(blocks)} blocks from {file.filename}", flush=True)
             

@@ -118,7 +118,9 @@ def _allocate_bucket_top_k(total_k: int, weights: Dict[str, float]) -> Dict[str,
 
 class _ZillizCollection:
     """
-    Single Zilliz collection (one index). Used internally; prefer VectorStore for routing.
+    Client for **one** Zilliz collection name (one index). ``VectorStore`` composes **three**
+    of these (text_chunks, code_blocks, tables) and merges search results — chat never uses
+    only this class alone for retrieval.
     """
 
     VECTOR_DIMENSION = 1536
@@ -970,6 +972,10 @@ class VectorStore:
         file_id: Optional[str] = None,
         query_text: Optional[str] = None,
     ) -> List[Dict]:
+        """
+        Search every typed collection (text, code, tables), merge, re-score by query intent, return top_k.
+        Chat retrieval always goes through this path — not a single-collection shortcut.
+        """
         weights = infer_retrieval_bucket_weights(query_text or "")
         limits = _allocate_bucket_top_k(top_k, weights)
         wmax = max(weights.values()) or 1.0

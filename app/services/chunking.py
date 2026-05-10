@@ -152,8 +152,10 @@ class ChunkingService:
                 continue
 
             if block_type == "image":
-                raw_image_id = raw_store.store_image(block.get("image_meta", {}), meta_base)
                 caption = content or f"Image on page {page_number}"
+                meta_for_image = dict(meta_base)
+                meta_for_image["caption"] = caption
+                raw_image_id = raw_store.store_image(block.get("image_meta", {}), meta_for_image)
                 chunks.append(caption)
                 meta = dict(meta_base)
                 meta["chunk_type"] = "image_caption"

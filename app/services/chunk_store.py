@@ -142,6 +142,47 @@ class ChunkStore:
                 }
             return result
 
+    def list_chunks_by_type(
+        self, document_id: str, chunk_type: str, limit: int = 20
+    ) -> List[Dict]:
+        """Return chunk rows for a document (e.g. image_caption) for supplemental retrieval."""
+        if not document_id or not chunk_type:
+            return []
+        limit = max(1, min(int(limit), 100))
+        if self._use_supabase:
+            resp = (
+                self.db.supabase.table("chunks")
+                .select("*")
+                .eq("document_id", document_id)
+                .eq("chunk_type", chunk_type)
+                .order("page_number")
+                .limit(limit)
+                .execute()
+            )
+            rows = resp.data or []
+        else:
+            with self.db.get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """SELECT * FROM chunks WHERE document_id = %s AND chunk_type = %s
+                       ORDER BY page_number ASC LIMIT %s""",
+                    (document_id, chunk_type, limit),
+                )
+                rows = cur.fetchall()
+        out: List[Dict] = []
+        for row in rows:
+            out.append({
+                "chunk_id": row["chunk_id"],
+                "document_id": row["document_id"],
+                "chunk_type": row["chunk_type"],
+                "retrieval_text": row["retrieval_text"],
+                "page_number": row["page_number"],
+                "section_title": row["section_title"],
+                "metadata_json": row["metadata_json"],
+                "created_at": row["created_at"],
+            })
+        return out
+
     def delete_document(self, document_id: str) -> None:
         """Delete all chunks for a document_id."""
         if not document_id:

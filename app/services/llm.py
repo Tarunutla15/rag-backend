@@ -71,6 +71,10 @@ OTHER RULES:
 - Multi-topic or comparison questions: use whatever relevant passages exist; synthesize comparisons when both sides appear.
 - Use chat history only to resolve pronouns and follow-ups, not to add facts absent from RETRIEVED CONTEXT.
 - Do not tell the user to "ask about Python instead" when they already asked a Python subtopic covered by the tags.
+- **Figures (RAW IMAGE):** Some excerpts include a `RAW IMAGE` block with `view_url=/documents/...` and a ready-made
+  Markdown image line. When the user asks to **see** or **show** a figure/diagram/image and that block is in context,
+  include that Markdown line verbatim in your answer so the app can display the image. Do not say the image is
+  "not available" if `view_url` is present.
 
 DO NOT HALLUCINATE: only state what the retrieved text reasonably supports."""
     
@@ -162,9 +166,20 @@ DO NOT HALLUCINATE: only state what the retrieved text reasonably supports."""
         def _format_raw_image(raw_image: Dict) -> str:
             if not raw_image:
                 return ""
-            caption = raw_image.get("caption") or ""
+            caption = (raw_image.get("caption") or "").strip()
             path = raw_image.get("image_path") or ""
-            return f"RAW IMAGE:\ncaption={caption}\npath={path}"
+            view_url = (raw_image.get("view_url") or "").strip()
+            lines = [
+                "RAW IMAGE (cropped figure from the PDF):",
+                f"caption={caption}",
+                f"storage_path={path}",
+            ]
+            if view_url:
+                lines.append(f"view_url={view_url}")
+                alt = (caption[:120] + "…") if len(caption) > 120 else (caption or "Figure from PDF")
+                lines.append("Include this exact Markdown in your reply so the user can see the image:")
+                lines.append(f"![{alt}]({view_url})")
+            return "\n".join(lines)
 
         context_parts: List[str] = []
         running = 0

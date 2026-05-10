@@ -171,6 +171,25 @@ class PDFProcessor:
         return lines_list
 
     @classmethod
+    def _page_context_before_image(cls, blocks: List[Dict], page_number: int, max_chars: int = 380) -> str:
+        """
+        Text or table summary already placed on the same page — often captions or paragraphs
+        that reference the figure (better retrieval than 'Image on page N' alone).
+        """
+        for b in reversed(blocks):
+            if b.get("page_number") != page_number:
+                continue
+            if b.get("block_type") == "text":
+                c = (b.get("content") or "").strip()
+                if c:
+                    return (c[-max_chars:] if len(c) > max_chars else c).strip()
+            if b.get("block_type") == "table":
+                s = (b.get("table_summary") or "").strip()
+                if s:
+                    return s[:max_chars].strip()
+        return ""
+
+    @classmethod
     def extract_blocks(cls, pdf_path: str) -> List[Dict]:
         """
         Extract structure-aware blocks from PDF.
@@ -280,10 +299,21 @@ class PDFProcessor:
                     images = []
                 for img in images:
                     block_id = str(uuid.uuid4())
+                    nearby = cls._page_context_before_image(blocks, page_index)
+                    section = (current_section_title or "").strip()
+                    parts = [
+                        f"Figure, diagram, or raster image on PDF page {page_index}.",
+                        "May be a chart, plot, architecture diagram, flowchart, screenshot, or illustration.",
+                    ]
+                    if section:
+                        parts.append(f"Section heading: {section}.")
+                    if nearby:
+                        parts.append(f"Text on the same page (may label or describe this figure): {nearby}")
+                    image_content = " ".join(parts)
                     blocks.append({
                         "block_id": block_id,
                         "block_type": "image",
-                        "content": f"Image on page {page_index}",
+                        "content": image_content,
                         "image_meta": img,
                         "page_number": page_index,
                         "section_title": current_section_title,

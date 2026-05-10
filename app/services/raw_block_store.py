@@ -77,7 +77,11 @@ class RawBlockStore:
         document_id = meta.get("document_id")
         page_number = meta.get("page_number", -1)
         created_at = int(time.time())
-        caption = meta.get("section_title") or f"Image on page {page_number}"
+        caption = (
+            meta.get("caption")
+            or meta.get("section_title")
+            or f"Image on page {page_number}"
+        )
         image_path = image_meta.get("name") if isinstance(image_meta, dict) else ""
 
         if self._use_supabase:

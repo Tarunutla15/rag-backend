@@ -56,7 +56,12 @@ class Settings(BaseSettings):
     # Keep original PDF and extracted images on disk after ingest (object-storage style).
     STORE_PDF_AFTER_INGEST: bool = True
     STORE_EXTRACTED_IMAGES: bool = True
-    
+    # Optional: OpenAI vision captions for cropped PDF images (uses OPENAI_API_KEY). Costs per image at ingest;
+    # improves retrieval for diagram/architecture/chart questions beyond page-only text.
+    ENABLE_VISION_IMAGE_CAPTIONS: bool = False
+    VISION_CAPTION_MODEL: str = "gpt-4o-mini"
+    MAX_VISION_CAPTIONS_PER_DOCUMENT: int = 30
+
     # Reranker: retrieve more chunks, then rerank to keep best (improves answer quality)
     ENABLE_RERANKER: bool = True
     RERANK_INITIAL_TOP_K: int = 30   # Fetch this many from vector search
